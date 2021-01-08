@@ -1,0 +1,214 @@
+#!/bin/bash
+# proxmox-backup-atomic 1.0.0
+# Copyright (c) 2021, Przemyslaw Kwiatkowski
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+## CONFIGURATION
+
+# You might need some or all of these variables as described in Proxmox Backup Client documentation.
+# Remember to export them!
+#export PBS_REPOSITORY=
+#export PBS_FINGERPRINT=
+#export PBS_PASSWORD=
+#export PBS_ENCRYPTION_PASSWORD=
+
+# You might want to add extra options to the proxmox-backup-client (see the man page)
+#EXTRA_OPTS="--keyfile /path/to/encryption-key.json --backup-id mybackup1"
+
+#
+# Do not edit beyond this point. :-)
+
+
+function help {
+cat >&2 <<EOF
+
+USAGE: proxmox-backup-atomic archivename.pxar:zfspool/dataset archivename.img:zfspool/zvol ...
+
+This wrapper script creates backup of a set of ZFS datasets and/or zvols.
+All backup sources are snapshotted AT THE SAME TIME and then the snapshots are stored on
+Proxmox Backup Server using standard proxmox-backup-client.
+You will get either backup of all data or none.
+
+Note: All sources data MUST be placed in the same ZFS pool.
+It is impossible to make "atomic" snapshot of more than one ZFS pool.
+
+This script should be run as root (or via sudo, or possibly via sudo -E).
+Running as regular user was not tested.
+EOF
+exit 255
+}
+
+
+DATASETS_ARCHIVES=()
+DATASETS_NAMES=()
+ZVOLS_ARCHIVES=()
+ZVOLS_NAMES=()
+ZVOLS_CLONES=()
+
+
+function interpret_arg() {
+    if ( echo "$1"|grep -q "\.pxar\:" ); then
+	DATASETS_ARCHIVES+=(`echo "$1"|cut -f 1 -d:`)
+	DATASETS_NAMES+=(`echo "$1"|cut -f 2 -d:|sed -e "s/$/@$SNAPNAME/"`)
+    elif ( echo "$1"|grep -q "\.img\:" ); then
+	ZVOLS_ARCHIVES+=(`echo "$1"|cut -f 1 -d:`)
+	ZVOLS_NAMES+=(`echo "$1"|cut -f 2 -d:|sed -e "s/$/@$SNAPNAME/"`)
+    else
+	return 1
+    fi
+    return 0
+}
+
+function create_snapshots() {
+    echo -n "Creating snapshots... " >&2
+    if ( zfs snapshot "${DATASETS_NAMES[@]}" "${ZVOLS_NAMES[@]}"); then
+	echo "done" >&2
+	return 0
+    else
+	echo "fail" >&2
+	return 1
+    fi
+}
+
+function destroy_snapshots() {
+    echo -n "Destoying snapshots... " >&2
+    local S
+    local ERR=0
+    for S in "${DATASETS_NAMES[@]}" "${ZVOLS_CLONES[@]}" "${ZVOLS_NAMES[@]}"; do
+	if ( ! zfs destroy "$S"); then
+	    ERR=1
+	fi
+    done
+    if [ "$ERR" == "0" ]; then
+	echo "done" >&2
+	return 0
+    else
+	echo "fail" >&2
+	return 1
+    fi
+}
+
+function mount_datasets() {
+    local N=0
+    while [ "$N" -lt ${#DATASETS_NAMES[@]} ]; do
+	mkdir "$TMP_DIR/$N"
+	if ( ! mount -t zfs ${DATASETS_NAMES[$N]} "$TMP_DIR/$N" ); then
+	    echo "Error mounting ${DATASETS_NAMES[$N]}" >&2
+	    return 1
+	fi
+	((N++))
+    done
+    return 0
+}
+
+function umount_datasets() {
+    if [ "${#DATASETS_NAMES[@]}" -gt 0 ]; then
+	umount "$TMP_DIR"/*
+	rm -d "$TMP_DIR"/*
+    fi
+}
+
+function clone_zvols() {
+    local POOL
+    local ERR=0
+    local N=0
+    while [ "$N" -lt ${#ZVOLS_NAMES[@]} ]; do
+	ZVOLS_CLONES[$N]="`echo "${ZVOLS_NAMES[$N]}"|cut -f1 -d/`/$SNAPNAME-$N"
+	if ( zfs list "${ZVOLS_CLONES[$N]}" 2>/dev/null ); then
+	    echo "Error clonnig ${ZVOLS_NAMES[$N]}" >&2
+	    ERR=1
+	    break
+	fi
+	if ( ! zfs clone -o com.sun:auto-snapshot=false "${ZVOLS_NAMES[$N]}" "${ZVOLS_CLONES[$N]}" ); then
+	    echo "Error clonnig ${ZVOLS_NAMES[$N]}" >&2
+	    ERR=1
+	    break
+	fi
+	((N++))
+    done
+
+    return $ERR
+}
+
+
+
+function prepare_cmdline() {
+    CMDLINE=""
+    local N=0
+    while [ "$N" -lt ${#DATASETS_NAMES[@]} ]; do
+	CMDLINE="$CMDLINE ${DATASETS_ARCHIVES[$N]}:$TMP_DIR/$N"
+	((N++))
+    done
+    N=0
+    while [ "$N" -lt ${#ZVOLS_CLONES[@]} ]; do
+	CMDLINE="$CMDLINE ${ZVOLS_ARCHIVES[$N]}:/dev/zvol/${ZVOLS_CLONES[$N]}"
+	((N++))
+    done
+}
+
+
+echo "proxmox-backup-atomic - ZFS backup made easy" >&2
+[ "$#" -eq 0 ] && help
+
+NECESSARY_EXECUTABLES="cat cut date echo grep sed zfs"
+if ! which $NECESSARY_EXECUTABLES >/dev/null 2>&1; then
+    echo "Missing binaries!" >&2
+    echo "Make sure these tools are available: $NECESSARY_EXECUTABLES" >&2
+    exit 255
+fi
+
+[ -z "$SNAPNAME" ] && SNAPNAME=`date +pb%s`
+
+while [ "$#" -gt 0 ]; do
+    interpret_arg "$1"
+    shift
+done
+
+TMP_DIR=$(mktemp -d -t proxmox-backup-atomic-XXXXXXXXXX)
+if [ ! -d "$TMP_DIR" ]; then
+    echo "Error: unable to create tmpdir." >&2
+    exit 1
+fi
+
+create_snapshots || exit 1
+mount_datasets || (umount_datasets; destroy_snapshots; exit 1)
+clone_zvols || (umount_datasets; destroy_snapshots; exit 1)
+prepare_cmdline
+
+echo "[calling proxmox-backup-client]" >&2
+if ( proxmox-backup-client backup $EXTRA_OPTS $CMDLINE ); then
+    echo "[proxmox-backup-client done]" >&2
+else
+    echo "[proxmox-backup-client failed]" >&2
+fi
+
+sleep 1
+umount_datasets
+destroy_snapshots
+rm -d "$TMP_DIR"
